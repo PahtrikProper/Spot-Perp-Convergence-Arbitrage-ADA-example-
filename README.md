@@ -2,7 +2,7 @@
 > Buy ADA spot on Exchange A + short ADAUSDT perpetual on Exchange B, then close both when prices converge.
 
 This README explains **what the strategy is**, **why it works**, **what risks exist**, and a **step-by-step execution checklist** you can follow.
-<img width="657" height="197" alt="image" src="https://github.com/user-attachments/assets/260b3f31-8ad6-4fbe-9e21-34db4a9e548f" />
+<img width="734" height="222" alt="image" src="https://github.com/user-attachments/assets/50e8dda4-cb46-4845-b55f-a80f042716cb" />
 
 ---
 

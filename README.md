@@ -232,3 +232,30 @@ This strategy works because **perps are structurally forced to track spot over t
 By holding **spot long** and **perp short** in equal size, you become **direction-neutral** and profit from **spread convergence** rather than ADA’s price movement.
 
 ---
+
+## 13) About the included Python paper-trading script
+
+This repository ships a runnable paper trader to observe the strategy live against Bybit’s public market data (`spot–perp-convergence-arbitrage.py`). It listens to **spot** and **linear perp** tickers over WebSockets, then simulates taker fills, fees, slippage, funding, margin usage, and a liquidation gauge for the **“perp rich”** direction (long spot + short perp).
+
+### Key behaviors
+- Enters when `(perp_mid - spot_mid) / spot_mid * 100 >= ENTRY_BASIS_PCT`.
+- Exits when the basis compresses to `EXIT_BASIS_PCT` or better, or when equity-based **take-profit** / **stop-loss** thresholds trigger.
+- Applies separate slippage and taker-fee assumptions per leg, tracks funding if provided by the stream, and shows a crude short-liq gauge based on configurable leverage and maintenance margin estimate.
+- Refreshes a terminal UI every `UI_REFRESH_SEC` seconds with current quotes, basis, position state, equity, fees, funding, and last action.
+
+### Configuration knobs (edit in the script)
+- `SYMBOL`: defaults to `ADAUSDT`; change to another Bybit symbol if desired.
+- `START_USDT`, `USDT_ALLOC_FRACTION`: starting balance and fraction of USDT deployed when entering.
+- `ENTRY_BASIS_PCT`, `EXIT_BASIS_PCT`: basis thresholds (percent) for entering/exiting.
+- `TAKE_PROFIT_USDT`, `STOP_LOSS_USDT`: equity stops in USDT terms.
+- `SPOT_TAKER_FEE_PCT`, `PERP_TAKER_FEE_PCT`: taker fee assumptions (percent).
+- `SPOT_SLIPPAGE_BPS`, `PERP_SLIPPAGE_BPS`: slippage buffers in basis points (bps).
+- `PERP_LEVERAGE`, `MMR_EST_PCT`: leverage and maintenance margin estimate for the short-liq gauge.
+- WebSocket endpoints (`WS_SPOT`, `WS_LINEAR`) point to Bybit public V5 spot and linear streams.
+
+### How to run (paper mode only)
+1) Install dependencies (Python 3.10+ recommended): `pip install websockets`.
+2) From the repo root, run: `python3 spot–perp-convergence-arbitrage.py`.
+3) Watch the terminal UI for live quotes, basis, positions, and stops. Press **Ctrl+C** to stop.
+
+> ⚠️ This is a **public-WS-only paper trader**: it does not place real orders, does not use private API keys, and liquidation math is approximate. Treat it as a learning/sandbox tool, not production risk management.

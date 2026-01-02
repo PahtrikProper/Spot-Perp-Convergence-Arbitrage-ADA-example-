@@ -243,6 +243,13 @@ This repository ships a runnable paper trader to observe the strategy live again
 - Applies separate slippage and taker-fee assumptions per leg, tracks funding if provided by the stream, and shows a crude short-liq gauge based on configurable leverage and maintenance margin estimate.
 - Refreshes a terminal UI every `UI_REFRESH_SEC` seconds with current quotes, basis, position state, equity, fees, funding, and last action.
 
+### Default configuration (as shipped)
+- **Symbol:** `ADAUSDT` on Bybit spot and linear perp feeds.
+- **Arming logic:** waits for the **maximum positive basis** seen so far to clear the fee/slippage + safety buffer, then arms with a **dynamic entry** at 70% (`ENTRY_FRACTION`) of that max basis.
+- **Capital usage:** deploys 95% of starting USDT (`USDT_ALLOC_FRACTION`) when an entry would trigger.
+- **Risk rails:** monitors a short liquidation guard using **3x leverage** and a **0.50%** maintenance margin estimate; equity stops are **+$1 take profit** / **-$2 stop loss** in USDT terms.
+- **Assumed costs:** taker fees of **0.10% spot / 0.055% perp**, slippage buffers of **2 bps** on each leg, plus a **5 bps** safety buffer when calculating the minimum viable basis.
+
 ### Configuration knobs (edit in the script)
 - `SYMBOL`: defaults to `ADAUSDT`; change to another Bybit symbol if desired.
 - `START_USDT`, `USDT_ALLOC_FRACTION`: starting balance and fraction of USDT deployed when entering.

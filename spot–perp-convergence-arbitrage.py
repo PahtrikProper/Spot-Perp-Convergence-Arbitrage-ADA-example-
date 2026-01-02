@@ -13,14 +13,15 @@ Strategy (classic "perp rich" case):
 - Exit when basis compresses to EXIT_BASIS_PCT (or better), or stop conditions hit:
     SELL spot at bid, BUY back perp at ask
 
-This script is designed to be "close to live" in mechanics:
-- Uses best bid/ask for fills
-- Applies taker fees and optional slippage bps
+Designed to be close to live mechanics:
+- Uses best bid/ask when available (top of book)
+- IMPORTANT FIX: Spot tickers often publish only lastPrice; we fall back to lastPrice as bid/ask.
+- Applies taker fees + configurable slippage
 - Applies funding at funding timestamps if provided by stream
 - Tracks spot holdings + perp PnL + margin usage
 
 Limitations:
-- No private endpoints -> cannot replicate exact Bybit liquidation/maintenance tiers.
+- Public-only: cannot replicate exact Bybit liquidation/maintenance tiers.
   Liquidation here is a fragility gauge, not exact.
 """
 
@@ -28,11 +29,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import websockets
 
@@ -43,7 +43,7 @@ SYMBOL = "ADAUSDT"
 
 START_USDT = 100.0
 
-# How often to print (seconds). WebSocket updates may arrive faster.
+# UI refresh rate (seconds)
 UI_REFRESH_SEC = 0.25
 
 # Trade sizing: fraction of available USDT used to buy spot when entering
@@ -53,11 +53,11 @@ USDT_ALLOC_FRACTION = 0.95
 ENTRY_BASIS_PCT = 0.60
 EXIT_BASIS_PCT  = 0.10
 
-# Optional "take profit" and "stop loss" on net equity (in USDT)
+# Optional equity stops (USDT)
 TAKE_PROFIT_USDT = 1.00   # stop after +$1.00 gain
 STOP_LOSS_USDT   = 2.00   # stop after -$2.00 loss
 
-# Fees (edit to match your tier / assumptions)
+# Fees (edit to match your tier)
 SPOT_TAKER_FEE_PCT = 0.10   # 0.10% example
 PERP_TAKER_FEE_PCT = 0.055  # 0.055% example
 
@@ -65,12 +65,11 @@ PERP_TAKER_FEE_PCT = 0.055  # 0.055% example
 SPOT_SLIPPAGE_BPS = 2.0
 PERP_SLIPPAGE_BPS = 2.0
 
-# Perp leverage (paper). Keep low if you want robustness.
+# Perp leverage (paper). Keep low for robustness.
 PERP_LEVERAGE = 3.0
 
-# Maintenance margin rate estimate for fragility gauge (approx)
+# Maintenance margin estimate for fragility gauge (approx)
 MMR_EST_PCT = 0.50  # 0.50%
-
 
 # =========================
 # Bybit V5 public WS
@@ -110,9 +109,12 @@ class LiveBookTop:
     next_funding_ms: Optional[int] = None
 
     def mid(self) -> Optional[float]:
-        if self.bid is None or self.ask is None:
-            return None
-        return (self.bid + self.ask) / 2.0
+        # Prefer bid/ask mid if available; otherwise fall back to lastPrice.
+        if self.bid is not None and self.ask is not None:
+            return (self.bid + self.ask) / 2.0
+        if self.last is not None:
+            return self.last
+        return None
 
 
 @dataclass
@@ -146,22 +148,18 @@ class PaperAccount:
     fees_paid: float = 0.0
     funding_net: float = 0.0
 
-    # bookkeeping
     last_action: str = "INIT"
     trades: int = 0
 
-    def equity(self, spot_mid: float, perp_mark: float) -> float:
+    def equity(self, spot_mark: float, perp_mark: float) -> float:
         return (
             self.usdt +
-            self.ada * spot_mid +
+            self.ada * spot_mark +
             self.perp.realized +
             self.perp.unrealized(perp_mark)
         )
 
 
-# =========================
-# Fragility / liq gauge (approx)
-# =========================
 def short_liq_price_est(entry: float, leverage: float, mmr_pct: float) -> float:
     """
     Crude isolated short liquidation gauge:
@@ -175,12 +173,10 @@ def short_liq_price_est(entry: float, leverage: float, mmr_pct: float) -> float:
     return entry * (1.0 + bump)
 
 
-# =========================
-# WebSocket client
-# =========================
 async def ws_ticker_stream(url: str, symbol: str, out: LiveBookTop, name: str):
     """
     Maintains a live ticker snapshot (bid/ask/last + funding if provided).
+    IMPORTANT: Spot tickers often publish only lastPrice; we fall back to lastPrice as bid/ask.
     """
     sub = {"op": "subscribe", "args": [f"tickers.{symbol}"]}
 
@@ -188,7 +184,6 @@ async def ws_ticker_stream(url: str, symbol: str, out: LiveBookTop, name: str):
         try:
             async with websockets.connect(url, ping_interval=None) as ws:
                 await ws.send(json.dumps(sub))
-
                 last_ping = time.time()
 
                 while True:
@@ -203,11 +198,7 @@ async def ws_ticker_stream(url: str, symbol: str, out: LiveBookTop, name: str):
                     msg = await ws.recv()
                     data = json.loads(msg)
 
-                    # ignore acks
-                    if isinstance(data, dict) and data.get("op") in ("pong", "ping") and "success" not in data:
-                        continue
-
-                    # ticker push has "topic": "tickers.SYMBOL" and "data": {...} or list
+                    # ignore acks/pongs
                     if not isinstance(data, dict):
                         continue
                     if "topic" not in data:
@@ -216,9 +207,8 @@ async def ws_ticker_stream(url: str, symbol: str, out: LiveBookTop, name: str):
                         continue
 
                     payload = data.get("data")
-                    # spot tickers are snapshot-only; linear may be snapshot/delta
-                    # payload can be dict or list of dicts
                     items = payload if isinstance(payload, list) else [payload]
+
                     for t in items:
                         if not isinstance(t, dict):
                             continue
@@ -234,7 +224,14 @@ async def ws_ticker_stream(url: str, symbol: str, out: LiveBookTop, name: str):
                         if last is not None:
                             out.last = float(last)
 
-                        # linear often has these:
+                        # ---- FIX: Spot often only has lastPrice; use it as bid/ask fallback.
+                        if out.last is not None:
+                            if out.bid is None:
+                                out.bid = out.last
+                            if out.ask is None:
+                                out.ask = out.last
+
+                        # linear-only fields (may exist)
                         if "fundingRate" in t and t["fundingRate"] is not None:
                             out.funding_rate = float(t["fundingRate"])
                         if "nextFundingTime" in t and t["nextFundingTime"] is not None:
@@ -243,15 +240,12 @@ async def ws_ticker_stream(url: str, symbol: str, out: LiveBookTop, name: str):
                             except Exception:
                                 pass
 
-        except Exception as e:
+        except Exception:
             # reconnect loop
             out.bid = out.ask = out.last = None
             await asyncio.sleep(1.0)
 
 
-# =========================
-# Trading / fills
-# =========================
 def apply_fee(amount_quote: float, fee_pct: float) -> float:
     return amount_quote * (fee_pct / 100.0)
 
@@ -272,11 +266,11 @@ def enter_trade(acct: PaperAccount, spot: LiveBookTop, perp: LiveBookTop) -> boo
     if spot.ask is None or perp.bid is None:
         return False
 
-    # size spot buy in USDT
     spend = max(acct.usdt * USDT_ALLOC_FRACTION, 0.0)
     if spend <= 1e-6:
         return False
 
+    # Buy spot at ask (taker)
     spot_fill = apply_slippage(spot.ask, SPOT_SLIPPAGE_BPS, "buy")
     spot_fee = apply_fee(spend, SPOT_TAKER_FEE_PCT)
     usdt_after_fee = spend - spot_fee
@@ -285,20 +279,17 @@ def enter_trade(acct: PaperAccount, spot: LiveBookTop, perp: LiveBookTop) -> boo
 
     qty_ada = usdt_after_fee / spot_fill
 
-    # PERP short same qty
+    # Short perp at bid (taker)
     perp_fill = apply_slippage(perp.bid, PERP_SLIPPAGE_BPS, "sell")
     perp_notional = qty_ada * perp_fill
     perp_fee = apply_fee(perp_notional, PERP_TAKER_FEE_PCT)
-
-    # margin posted (isolated) based on leverage
     margin = perp_notional / max(PERP_LEVERAGE, 1e-9)
 
-    # Check if we have enough USDT to cover spot spend + perp fee + margin
-    total_usdt_needed = spend + perp_fee + margin
-    if total_usdt_needed > acct.usdt + 1e-9:
+    total_needed = spend + perp_fee + margin
+    if total_needed > acct.usdt + 1e-9:
         return False
 
-    # Apply
+    # Apply changes
     acct.usdt -= spend
     acct.fees_paid += spot_fee
 
@@ -325,17 +316,15 @@ def exit_trade(acct: PaperAccount, spot: LiveBookTop, perp: LiveBookTop) -> bool
 
     qty = abs(acct.perp.qty)
 
-    # close perp short: buy back at ask
+    # Close perp short: buy back at ask
     perp_fill = apply_slippage(perp.ask, PERP_SLIPPAGE_BPS, "buy")
     close_notional = qty * perp_fill
     perp_fee = apply_fee(close_notional, PERP_TAKER_FEE_PCT)
 
-    # realized pnl on perp
     realized = acct.perp.qty * (perp_fill - acct.perp.entry)  # qty negative
 
-    # release margin
+    # Release margin, pay fee, book realized
     acct.usdt += acct.perp.margin
-
     acct.usdt -= perp_fee
     acct.fees_paid += perp_fee
 
@@ -344,14 +333,13 @@ def exit_trade(acct: PaperAccount, spot: LiveBookTop, perp: LiveBookTop) -> bool
     acct.perp.entry = 0.0
     acct.perp.margin = 0.0
 
-    # sell spot ADA at bid
+    # Sell spot ADA at bid
     spot_fill = apply_slippage(spot.bid, SPOT_SLIPPAGE_BPS, "sell")
     gross = acct.ada * spot_fill
     spot_fee = apply_fee(gross, SPOT_TAKER_FEE_PCT)
 
     acct.usdt += (gross - spot_fee)
     acct.fees_paid += spot_fee
-
     acct.ada = 0.0
 
     acct.trades += 1
@@ -362,10 +350,10 @@ def exit_trade(acct: PaperAccount, spot: LiveBookTop, perp: LiveBookTop) -> bool
 def apply_funding_if_due(acct: PaperAccount, perp: LiveBookTop, perp_mark: float, now_ms: int) -> Optional[str]:
     """
     Applies one funding event when now_ms passes nextFundingTime (if provided).
-    Funding is paid on notional. For a SHORT:
-      - if funding_rate > 0: receive (positive cashflow)
-      - if funding_rate < 0: pay
-    This is a simplified model; Bybit uses mark/index mechanics but the rate is the driver.
+    Funding is applied on perp notional.
+    For a SHORT:
+      - funding_rate > 0 => you RECEIVE
+      - funding_rate < 0 => you PAY
     """
     if not acct.perp.is_open():
         return None
@@ -376,30 +364,26 @@ def apply_funding_if_due(acct: PaperAccount, perp: LiveBookTop, perp_mark: float
 
     notional = acct.perp.notional(perp_mark)
     fr = perp.funding_rate  # decimal
-    # For linear perps: payment from longs to shorts when fr>0
-    # Our position qty is negative for short. We receive +notional*fr when fr>0.
-    payment = notional * fr * (-1.0 if acct.perp.qty > 0 else 1.0)
+    payment = notional * fr  # short receives positive fr
 
     acct.usdt += payment
     acct.funding_net += payment
 
-    # prevent repeated application until stream updates next funding time
-    perp.next_funding_ms = perp.next_funding_ms + 8 * 60 * 60 * 1000  # fallback bump; stream should correct
+    # Prevent re-applying until stream updates next funding time.
+    # (If stream updates, it will overwrite this value.)
+    perp.next_funding_ms = perp.next_funding_ms + 8 * 60 * 60 * 1000
 
     return f"FUNDING: {fr*100:+.4f}% on notional {notional:.2f} => {payment:+.4f} USDT"
 
 
-# =========================
-# Main loop
-# =========================
 async def paper_trader():
     spot = LiveBookTop()
     perp = LiveBookTop()
     acct = PaperAccount()
 
-    # start WS tasks
-    t1 = asyncio.create_task(ws_ticker_stream(WS_SPOT, SYMBOL, spot, "SPOT"))
-    t2 = asyncio.create_task(ws_ticker_stream(WS_LINEAR, SYMBOL, perp, "LINEAR"))
+    # WS tasks
+    t_spot = asyncio.create_task(ws_ticker_stream(WS_SPOT, SYMBOL, spot, "SPOT"))
+    t_perp = asyncio.create_task(ws_ticker_stream(WS_LINEAR, SYMBOL, perp, "LINEAR"))
 
     start_equity: Optional[float] = None
     last_print = 0.0
@@ -407,7 +391,6 @@ async def paper_trader():
 
     try:
         while True:
-            # need both mids to compute basis
             spot_mid = spot.mid()
             perp_mid = perp.mid()
 
@@ -427,55 +410,44 @@ async def paper_trader():
                 if note:
                     last_note = note
 
-                # liquidation fragility gauge if perp open
-                liq = None
-                liq_dist = None
+                # liquidation fragility gauge (paper)
                 if acct.perp.is_open():
                     liq = short_liq_price_est(acct.perp.entry, PERP_LEVERAGE, MMR_EST_PCT)
-                    liq_dist = (liq - perp_mid) / perp_mid * 100.0
-
-                    # stop if we would be "liquidated" by our gauge (paper)
                     if perp_mid >= liq:
-                        # close everything immediately at market
                         exit_trade(acct, spot, perp)
                         last_note = "STOP: LIQ gauge hit (paper). Closed positions."
 
-                # entry/exit logic (classic perp-rich only)
+                # Strategy: trade only the classic "perp rich" direction
                 if not acct.perp.is_open():
                     if basis >= ENTRY_BASIS_PCT:
-                        ok = enter_trade(acct, spot, perp)
-                        if ok:
+                        if enter_trade(acct, spot, perp):
                             last_note = "ENTER triggered by basis."
                 else:
-                    # exit when basis compresses
                     if basis <= EXIT_BASIS_PCT:
-                        ok = exit_trade(acct, spot, perp)
-                        if ok:
+                        if exit_trade(acct, spot, perp):
                             last_note = "EXIT triggered by basis compression."
 
                 # equity stops
                 eq = acct.equity(spot_mid, perp_mid)
-                if start_equity is not None:
-                    pnl = eq - start_equity
-                    if pnl >= TAKE_PROFIT_USDT:
-                        if acct.perp.is_open():
-                            exit_trade(acct, spot, perp)
-                        last_note = f"TAKE PROFIT hit: {pnl:+.4f} USDT"
-                        # stop
-                        pass_stop = True
-                        # print one last time then break
-                        clear_screen()
-                        print("TAKE PROFIT - STOPPED")
-                        break
-                    if pnl <= -STOP_LOSS_USDT:
-                        if acct.perp.is_open():
-                            exit_trade(acct, spot, perp)
-                        last_note = f"STOP LOSS hit: {pnl:+.4f} USDT"
-                        clear_screen()
-                        print("STOP LOSS - STOPPED")
-                        break
+                pnl = eq - start_equity
 
-            # UI refresh
+                if pnl >= TAKE_PROFIT_USDT:
+                    if acct.perp.is_open():
+                        exit_trade(acct, spot, perp)
+                    last_note = f"TAKE PROFIT hit: {pnl:+.4f} USDT"
+                    clear_screen()
+                    print("TAKE PROFIT - STOPPED")
+                    break
+
+                if pnl <= -STOP_LOSS_USDT:
+                    if acct.perp.is_open():
+                        exit_trade(acct, spot, perp)
+                    last_note = f"STOP LOSS hit: {pnl:+.4f} USDT"
+                    clear_screen()
+                    print("STOP LOSS - STOPPED")
+                    break
+
+            # UI
             now = time.time()
             if now - last_print >= UI_REFRESH_SEC:
                 last_print = now
@@ -485,25 +457,27 @@ async def paper_trader():
                 perp_mid = perp.mid()
 
                 print(f"Bybit LIVE PAPER TRADER (public WS) | {SYMBOL} | UTC {now_hms()}")
-                print("-" * 90)
+                print("-" * 100)
 
                 print(f"SPOT  bid/ask: {fmt(spot.bid)} / {fmt(spot.ask)} | mid {fmt(spot_mid)}")
                 print(f"PERP  bid/ask: {fmt(perp.bid)} / {fmt(perp.ask)} | mid {fmt(perp_mid)}")
+
                 if perp.funding_rate is not None:
-                    print(f"Funding rate (stream): {perp.funding_rate*100:+.4f}% | nextFundingTime(ms): {perp.next_funding_ms or '-'}")
+                    fr = perp.funding_rate * 100.0
+                    print(f"Funding rate (stream): {fr:+.4f}% | nextFundingTime(ms): {perp.next_funding_ms or '-'}")
                 else:
                     print("Funding rate (stream): -")
-                print("-" * 90)
+
+                print("-" * 100)
 
                 if spot_mid is not None and perp_mid is not None:
                     basis = (perp_mid - spot_mid) / spot_mid * 100.0
-                    print(f"Basis % (perp - spot): {basis:+.4f}% | ENTRY {ENTRY_BASIS_PCT:.2f}% | EXIT {EXIT_BASIS_PCT:.2f}%")
+                    print(f"Basis %: {basis:+.4f}% | ENTRY {ENTRY_BASIS_PCT:.2f}% | EXIT {EXIT_BASIS_PCT:.2f}%")
                 else:
                     print("Basis %: - (waiting for live quotes)")
 
-                print("-" * 90)
+                print("-" * 100)
 
-                # Account status
                 if spot_mid is not None and perp_mid is not None:
                     eq = acct.equity(spot_mid, perp_mid)
                     if start_equity is None:
@@ -511,13 +485,14 @@ async def paper_trader():
                     pnl = eq - start_equity
 
                     print(f"Balances: USDT={acct.usdt:.4f} | ADA={acct.ada:.6f}")
+
                     if acct.perp.is_open():
                         u = acct.perp.unrealized(perp_mid)
                         notional = acct.perp.notional(perp_mid)
                         liq = short_liq_price_est(acct.perp.entry, PERP_LEVERAGE, MMR_EST_PCT)
                         liq_dist = (liq - perp_mid) / perp_mid * 100.0
                         print(f"PERP: qty={acct.perp.qty:.6f} ADA | entry={acct.perp.entry:.6f} | uPnL={u:+.4f} | margin={acct.perp.margin:.4f} | notional={notional:.2f}")
-                        print(f"LIQ gauge (short): {liq:.6f}  (distance {liq_dist:.2f}% above mark) | leverage={PERP_LEVERAGE:.2f}x | MMR~{MMR_EST_PCT:.2f}%")
+                        print(f"LIQ gauge (short): {liq:.6f} (distance {liq_dist:.2f}% above mark) | lev={PERP_LEVERAGE:.2f}x | MMR~{MMR_EST_PCT:.2f}%")
                     else:
                         print("PERP: flat")
 
@@ -530,7 +505,7 @@ async def paper_trader():
                 if last_note:
                     print(f"Note: {last_note}")
 
-                print("-" * 90)
+                print("-" * 100)
                 print("Ctrl+C to stop.")
 
             await asyncio.sleep(0.02)
@@ -539,10 +514,11 @@ async def paper_trader():
         clear_screen()
         print("Stopped by user.")
     finally:
-        t1.cancel()
-        t2.cancel()
-        await asyncio.gather(t1, t2, return_exceptions=True)
+        t_spot.cancel()
+        t_perp.cancel()
+        await asyncio.gather(t_spot, t_perp, return_exceptions=True)
 
 
 if __name__ == "__main__":
     asyncio.run(paper_trader())
+

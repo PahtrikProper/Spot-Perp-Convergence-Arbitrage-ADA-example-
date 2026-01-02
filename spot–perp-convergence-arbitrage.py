@@ -16,7 +16,7 @@ import websockets
 # =========================
 # CONFIG
 # =========================
-SYMBOL = "SOLUSDT"
+SYMBOL = "ADAUSDT"
 START_USDT = 100.0
 
 UI_REFRESH_SEC = 0.25

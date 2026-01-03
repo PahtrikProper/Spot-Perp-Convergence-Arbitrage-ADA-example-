@@ -249,6 +249,8 @@ This repository ships a runnable paper trader to observe the strategy live again
 - **Capital usage:** deploys 95% of starting USDT (`USDT_ALLOC_FRACTION`) when an entry would trigger.
 - **Risk rails:** monitors a short liquidation guard using **3x leverage** and a **0.50%** maintenance margin estimate; equity stops are **+$1 take profit** / **-$2 stop loss** in USDT terms.
 - **Assumed costs:** taker fees of **0.10% spot / 0.055% perp**, slippage buffers of **2 bps** on each leg, plus a **5 bps** safety buffer when calculating the minimum viable basis.
+- **Exit compression:** when in a position, exits on the first of the equity guards or when the basis compresses to `max(EXIT_BASIS_PCT, open_basis * EXIT_COMPRESSION_FRACTION)`, with `EXIT_COMPRESSION_FRACTION` defaulting to **30%**.
+- **Simulated fills:** the paper trader now **enters and exits** positions (spot buy + perp short, then spot sell + perp cover) using the configured slippage and fee assumptions, and releases locked margin on exit.
 
 ### Configuration knobs (edit in the script)
 - `SYMBOL`: defaults to `ADAUSDT`; change to another Bybit symbol if desired.

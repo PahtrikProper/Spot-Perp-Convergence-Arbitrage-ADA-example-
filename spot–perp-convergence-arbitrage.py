@@ -8,15 +8,18 @@ NOTHING IS SILENT.
 """
 
 from __future__ import annotations
-import asyncio, json, os, time
+import asyncio, csv, json, os, time
 from dataclasses import dataclass, field
 from typing import Optional
 import websockets
+import statistics
+from collections import deque
 
 # =========================
 # CONFIG
 # =========================
-SYMBOL = "ADAUSDT"
+SYMBOL = "SOLUSDT"
+BASE_ASSET = SYMBOL.replace("USDT", "").replace("USD", "")
 START_USDT = 100.0
 
 UI_REFRESH_SEC = 0.25
@@ -42,6 +45,34 @@ WS_SPOT   = "wss://stream.bybit.com/v5/public/spot"
 WS_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 PING_EVERY_SEC = 20.0
 
+MIN_BASIS_PCT = 0.18
+MAX_HOLD_SECONDS = 90
+MIN_FUNDING_ABS = 0.005
+TREND_SLOPE_MAX = 0.0008
+ROLLING_STD_MULT = 1.5
+BASIS_STD_WINDOW_SEC = 120
+EMA_PERIOD_SEC = 30.0
+ROLLING_PNL_TRADES = 5
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRADE_LOG_PATH = os.path.join(SCRIPT_DIR, "trade_log.csv")
+TRADE_LOG_HEADERS = [
+    "timestamp_utc",
+    "action",
+    "basis_pct",
+    "spot_price",
+    "perp_price",
+    "qty",
+    "realized_pnl",
+    "fees",
+    "usdt_balance",
+    "base_balance",
+    "perp_qty",
+    "perp_entry",
+    "perp_margin",
+    "note",
+]
+
 
 # =========================
 # HELPERS
@@ -57,6 +88,47 @@ def fmt(x, n=6):
 
 def bps_to_pct(bps):
     return bps / 100.0
+
+
+def log_trade(
+    action: str,
+    *,
+    basis_pct: float,
+    spot_price: float,
+    perp_price: float,
+    qty: float,
+    fees: float,
+    realized_pnl: float,
+    usdt_balance: float,
+    base_balance: float,
+    perp_qty: float,
+    perp_entry: float,
+    perp_margin: float,
+    note: str = "",
+):
+    row = {
+        "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "action": action,
+        "basis_pct": f"{basis_pct:.6f}",
+        "spot_price": f"{spot_price:.8f}",
+        "perp_price": f"{perp_price:.8f}",
+        "qty": f"{qty:.8f}",
+        "realized_pnl": f"{realized_pnl:.8f}",
+        "fees": f"{fees:.8f}",
+        "usdt_balance": f"{usdt_balance:.8f}",
+        "base_balance": f"{base_balance:.8f}",
+        "perp_qty": f"{perp_qty:.8f}",
+        "perp_entry": f"{perp_entry:.8f}",
+        "perp_margin": f"{perp_margin:.8f}",
+        "note": note,
+    }
+
+    file_exists = os.path.exists(TRADE_LOG_PATH)
+    with open(TRADE_LOG_PATH, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_LOG_HEADERS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 # =========================
@@ -102,6 +174,7 @@ class Account:
     funding: float = 0.0
     trades: int = 0
     last_action: str = "INIT"
+    spot_margin: float = 0.0
 
     def equity(self, spot, perp):
         return (
@@ -136,6 +209,106 @@ def fee(x, pct):
 def slip(price, bps, side):
     pct = bps_to_pct(bps) / 100
     return price * (1 + pct if side == "buy" else 1 - pct)
+
+
+def predict_pnl_if_enter(
+    *,
+    spot_price,
+    perp_price,
+    basis,
+    trade_dir,
+    usdt_balance,
+):
+    spot_side = "buy" if trade_dir == "SHORT_PERP_LONG_SPOT" else "sell"
+    perp_side = "sell" if trade_dir == "SHORT_PERP_LONG_SPOT" else "buy"
+
+    spot_fill = slip(spot_price, SPOT_SLIPPAGE_BPS, spot_side)
+    perp_fill = slip(perp_price, PERP_SLIPPAGE_BPS, perp_side)
+
+    usdt_alloc = usdt_balance * USDT_ALLOC_FRACTION
+    if usdt_alloc <= 0:
+        return None
+
+    base_cost = spot_fill * (1 + SPOT_TAKER_FEE_PCT / 100)
+    perp_cost = perp_fill * (PERP_TAKER_FEE_PCT / 100 + 1 / PERP_LEVERAGE)
+    cost_per_unit = base_cost + perp_cost
+    max_affordable_qty = usdt_balance / cost_per_unit if cost_per_unit > 0 else 0
+    qty = min(usdt_alloc / spot_fill, max_affordable_qty)
+    if qty <= 0:
+        return None
+
+    target_basis = basis * 0.25
+    if trade_dir == "SHORT_PERP_LONG_SPOT":
+        spot_entry = spot_fill
+        spot_exit = spot_entry
+        perp_entry = perp_fill
+        perp_exit = spot_exit * (1 + target_basis / 100)
+
+        spot_pnl = (spot_exit - spot_entry) * qty
+        perp_pnl = -qty * (perp_exit - perp_entry)
+    else:
+        spot_entry = spot_fill
+        spot_exit = spot_entry
+        perp_entry = perp_fill
+        perp_exit = spot_exit * (1 + target_basis / 100)
+
+        spot_pnl = (spot_entry - spot_exit) * qty
+        perp_pnl = qty * (perp_exit - perp_entry)
+
+    spot_fee_entry = fee(abs(spot_entry * qty), SPOT_TAKER_FEE_PCT)
+    spot_fee_exit = fee(abs(spot_exit * qty), SPOT_TAKER_FEE_PCT)
+    perp_fee_entry = fee(abs(perp_entry * qty), PERP_TAKER_FEE_PCT)
+    perp_fee_exit = fee(abs(perp_exit * qty), PERP_TAKER_FEE_PCT)
+
+    total_fees = spot_fee_entry + spot_fee_exit + perp_fee_entry + perp_fee_exit
+    return spot_pnl + perp_pnl - total_fees
+
+
+def should_enter_trade(
+    basis_pct,
+    funding_rate,
+    fee_pct,
+    basis_std,
+    vwap_slope,
+):
+    if abs(vwap_slope) > TREND_SLOPE_MAX:
+        return False, "TREND_FILTER"
+
+    if funding_rate is None or abs(funding_rate) < MIN_FUNDING_ABS:
+        return False, "FUNDING_TOO_SMALL"
+
+    trade_dir = "SHORT_PERP_LONG_SPOT" if funding_rate > 0 else "LONG_PERP_SHORT_SPOT"
+
+    dynamic_min_basis = max(
+        2 * fee_pct,
+        basis_std * ROLLING_STD_MULT,
+        MIN_BASIS_PCT,
+    )
+
+    if abs(basis_pct) < dynamic_min_basis:
+        return False, "BASIS_TOO_SMALL"
+
+    if trade_dir == "SHORT_PERP_LONG_SPOT" and basis_pct <= 0:
+        return False, "BASIS_DIRECTION_MISMATCH"
+    if trade_dir == "LONG_PERP_SHORT_SPOT" and basis_pct >= 0:
+        return False, "BASIS_DIRECTION_MISMATCH"
+
+    return True, trade_dir
+
+
+def should_exit_trade(
+    basis_pct,
+    entry_basis,
+    entry_time,
+    now_ts,
+):
+    if abs(basis_pct) < abs(entry_basis) * 0.25:
+        return True, "CONVERGED"
+
+    if now_ts - entry_time > MAX_HOLD_SECONDS:
+        return True, "TIME_STOP"
+
+    return False, ""
 
 
 # =========================
@@ -199,6 +372,16 @@ async def main():
     armed = False
     open_basis = None
     start_eq = None
+    entry_time = None
+    trading_enabled = True
+    ema_price = None
+    last_ema_ts = None
+    vwap_slope = 0.0
+    basis_std = 0.0
+    basis_history: deque = deque()
+    rolling_pnl: deque = deque()
+    predicted_pnl = None
+    predicted_reason = "-"
 
     asyncio.create_task(ws_stream(WS_SPOT, SYMBOL, spot, "SPOT"))
     asyncio.create_task(ws_stream(WS_LINEAR, SYMBOL, perp, "PERP"))
@@ -213,8 +396,49 @@ async def main():
                 start_eq = acct.equity(s, p)
 
             basis = (p - s) / s * 100
+            predicted_pnl = None
+            predicted_reason = "-"
+
+            now_ts = time.time()
+
+            if ema_price is None:
+                ema_price = (s + p) / 2
+                last_ema_ts = now_ts
+            else:
+                dt = max(now_ts - last_ema_ts, 1e-6)
+                alpha = 1 - pow(2.718281828, -dt / EMA_PERIOD_SEC)
+                prev_ema = ema_price
+                ema_price = prev_ema + alpha * (((s + p) / 2) - prev_ema)
+                vwap_slope = (ema_price - prev_ema) / dt
+                last_ema_ts = now_ts
+
+            basis_history.append((now_ts, basis))
+            while basis_history and now_ts - basis_history[0][0] > BASIS_STD_WINDOW_SEC:
+                basis_history.popleft()
+            basis_values = [b for _, b in basis_history]
+            basis_std = statistics.pstdev(basis_values) if len(basis_values) > 1 else 0.0
+
+            fee_pct = 2 * (SPOT_TAKER_FEE_PCT + PERP_TAKER_FEE_PCT)
 
             print(f"[TICK] spot={s:.6f} perp={p:.6f} basis={basis:+.4f}%")
+
+            # Predict PnL for current conditions using funding direction if available
+            funding_pct = perp.funding_rate * 100 if perp.funding_rate is not None else None
+            if funding_pct is None or abs(funding_pct) < MIN_FUNDING_ABS:
+                predicted_reason = "FUNDING_TOO_SMALL"
+                predicted_pnl = None
+            else:
+                candidate_dir = "SHORT_PERP_LONG_SPOT" if funding_pct > 0 else "LONG_PERP_SHORT_SPOT"
+                predicted_pnl = predict_pnl_if_enter(
+                    spot_price=s,
+                    perp_price=p,
+                    basis=basis,
+                    trade_dir=candidate_dir,
+                    usdt_balance=acct.usdt,
+                )
+                predicted_reason = f"DIR={candidate_dir}"
+                if predicted_pnl is None:
+                    predicted_reason += " NO_SIZE"
 
             if acct.perp.open():
                 liq = liq_price_short(acct.perp.entry)
@@ -225,96 +449,141 @@ async def main():
                 exit_basis = max(EXIT_BASIS_PCT, (open_basis or 0.0) * EXIT_COMPRESSION_FRACTION)
                 tp_hit = pnl >= TAKE_PROFIT_USDT
                 sl_hit = pnl <= -STOP_LOSS_USDT
-                basis_hit = basis <= exit_basis
-                liq_hit = p >= liq
+                basis_hit = basis <= exit_basis if acct.perp.qty < 0 else basis >= -exit_basis
+                liq_hit = p >= liq if acct.perp.qty < 0 else p <= (acct.perp.entry * (1 - max((1 / PERP_LEVERAGE) - (MMR_EST_PCT / 100), 0)))
+                time_stop, time_reason = should_exit_trade(basis, open_basis or basis, entry_time or now_ts, now_ts)
 
                 print(
                     f"[POSITION] basis={basis:+.4f}% open_basis={fmt(open_basis,4)} "
                     f"exit_thresh={exit_basis:.4f}% pnl={pnl:+.4f}USDT"
                 )
                 print(
-                    f"[EXIT CHECK] tp={tp_hit} sl={sl_hit} basis_hit={basis_hit} liq_hit={liq_hit}"
+                    f"[EXIT CHECK] tp={tp_hit} sl={sl_hit} basis_hit={basis_hit} liq_hit={liq_hit} time_stop={time_stop}"
                 )
 
-                if tp_hit or sl_hit or basis_hit or liq_hit:
-                    spot_exit = slip(s, SPOT_SLIPPAGE_BPS, "sell")
-                    perp_exit = slip(p, PERP_SLIPPAGE_BPS, "buy")
+                exit_needed, exit_reason = should_exit_trade(basis, open_basis or basis, entry_time or now_ts, now_ts)
+                if tp_hit or sl_hit or basis_hit or liq_hit or time_stop or exit_needed:
+                    if acct.perp.qty < 0:
+                        spot_exit = slip(s, SPOT_SLIPPAGE_BPS, "sell")
+                        perp_exit = slip(p, PERP_SLIPPAGE_BPS, "buy")
 
-                    spot_proceeds = acct.base * spot_exit
-                    spot_fee = fee(spot_proceeds, SPOT_TAKER_FEE_PCT)
+                        exit_qty = acct.base
+                        exit_perp_entry = acct.perp.entry
+                        exit_perp_margin = acct.perp.margin
 
-                    perp_notional = abs(acct.perp.qty) * perp_exit
-                    perp_fee = fee(perp_notional, PERP_TAKER_FEE_PCT)
-                    perp_realized = acct.perp.qty * (perp_exit - acct.perp.entry)
+                        spot_proceeds = acct.base * spot_exit
+                        spot_fee = fee(spot_proceeds, SPOT_TAKER_FEE_PCT)
 
-                    acct.fees += spot_fee + perp_fee
-                    acct.perp.realized += perp_realized
-                    acct.usdt += spot_proceeds - spot_fee + perp_realized + acct.perp.margin - perp_fee
+                        perp_notional = abs(acct.perp.qty) * perp_exit
+                        perp_fee = fee(perp_notional, PERP_TAKER_FEE_PCT)
+                        perp_realized = acct.perp.qty * (perp_exit - acct.perp.entry)
+
+                        acct.fees += spot_fee + perp_fee
+                        acct.perp.realized += perp_realized
+                        acct.usdt += spot_proceeds - spot_fee + perp_realized + acct.perp.margin - perp_fee
+                    else:
+                        spot_exit = slip(s, SPOT_SLIPPAGE_BPS, "buy")
+                        perp_exit = slip(p, PERP_SLIPPAGE_BPS, "sell")
+
+                        exit_qty = abs(acct.base)
+                        exit_perp_entry = acct.perp.entry
+                        exit_perp_margin = acct.perp.margin
+
+                        spot_cost = exit_qty * spot_exit
+                        spot_fee = fee(spot_cost, SPOT_TAKER_FEE_PCT)
+
+                        perp_notional = abs(acct.perp.qty) * perp_exit
+                        perp_fee = fee(perp_notional, PERP_TAKER_FEE_PCT)
+                        perp_realized = acct.perp.qty * (perp_exit - acct.perp.entry)
+
+                        acct.fees += spot_fee + perp_fee
+                        acct.perp.realized += perp_realized
+                        acct.usdt += acct.spot_margin - spot_cost - spot_fee + perp_realized + acct.perp.margin - perp_fee
 
                     print(
-                        f"[EXIT] spot_sell={spot_exit:.6f} perp_cover={perp_exit:.6f} "
-                        f"realized={perp_realized:+.6f} fees={spot_fee+perp_fee:.6f}"
+                        f"[EXIT] spot_px={spot_exit:.6f} perp_px={perp_exit:.6f} "
+                        f"realized={perp_realized:+.6f} fees={spot_fee+perp_fee:.6f} reason={exit_reason or time_reason or 'EXIT_CHECK'}"
                     )
 
                     acct.base = 0.0
                     acct.perp = PerpPos()
+                    acct.spot_margin = 0.0
                     acct.trades += 1
                     acct.last_action = "EXIT"
+
+                    log_trade(
+                        "EXIT",
+                        basis_pct=basis,
+                        spot_price=spot_exit,
+                        perp_price=perp_exit,
+                        qty=exit_qty,
+                        fees=spot_fee + perp_fee,
+                        realized_pnl=perp_realized,
+                        usdt_balance=acct.usdt,
+                        base_balance=acct.base,
+                        perp_qty=acct.perp.qty,
+                        perp_entry=exit_perp_entry,
+                        perp_margin=exit_perp_margin,
+                        note=f"pnl={pnl:+.4f}USDT reason={exit_reason or time_reason}",
+                    )
+
+                    rolling_pnl.append(pnl)
+                    if len(rolling_pnl) > ROLLING_PNL_TRADES:
+                        rolling_pnl.popleft()
+                    if sum(rolling_pnl) < 0:
+                        trading_enabled = False
+                        print("[KILL SWITCH] Rolling PnL negative — disabling new entries")
+
                     open_basis = None
                     max_pos_basis = 0.0
                     dyn_entry = None
                     armed = False
+                    entry_time = None
                     start_eq = acct.equity(s, p)
                 else:
                     print("[HOLD] Staying in position")
             else:
                 start_eq = acct.equity(s, p)
-                if basis > 0:
-                    if basis > max_pos_basis:
-                        print(f"[BASIS] New MAX POSITIVE BASIS: {basis:+.4f}% (prev {max_pos_basis:+.4f}%)")
-                        max_pos_basis = basis
-
-                min_ok, fee_part, slip_part = min_viable_basis()
-
-                print(
-                    f"[CHECK] min_viable={min_ok:.4f}% "
-                    f"(fees={fee_part:.4f}% slip={slip_part:.4f}% buffer={SAFETY_BUFFER_PCT:.4f}%)"
+                can_enter, trade_dir = should_enter_trade(
+                    basis,
+                    perp.funding_rate * 100 if perp.funding_rate is not None else None,
+                    fee_pct,
+                    basis_std,
+                    vwap_slope,
                 )
 
-                if max_pos_basis >= min_ok:
-                    armed = True
-                    dyn_entry = max_pos_basis * ENTRY_FRACTION
-                    print(f"[ARM] Strategy ARMED | dynamic_entry={dyn_entry:.4f}%")
+                print(
+                    f"[CHECK] trend_slope={vwap_slope:+.6f} basis_std={basis_std:.4f} "
+                    f"funding={fmt(perp.funding_rate)} trade_dir={trade_dir if can_enter else 'BLOCKED'} "
+                    f"trading_enabled={trading_enabled}"
+                )
+
+                if not trading_enabled:
+                    print("[ENTRY CHECK] Trading disabled by kill switch")
+                elif not can_enter:
+                    print(f"[ENTRY CHECK] Blocked: {trade_dir}")
                 else:
-                    armed = False
-                    dyn_entry = None
-                    print("[ARM] Strategy DISARMED (insufficient edge)")
+                    spot_side = "buy" if trade_dir == "SHORT_PERP_LONG_SPOT" else "sell"
+                    perp_side = "sell" if trade_dir == "SHORT_PERP_LONG_SPOT" else "buy"
 
-                if armed:
-                    print(
-                        f"[ENTRY CHECK] basis={basis:.4f}% "
-                        f"required={dyn_entry:.4f}%"
-                    )
-                    if dyn_entry and basis >= dyn_entry:
-                        spot_fill = slip(s, SPOT_SLIPPAGE_BPS, "buy")
-                        perp_fill = slip(p, PERP_SLIPPAGE_BPS, "sell")
+                    spot_fill = slip(s, SPOT_SLIPPAGE_BPS, spot_side)
+                    perp_fill = slip(p, PERP_SLIPPAGE_BPS, perp_side)
 
-                        usdt_alloc = acct.usdt * USDT_ALLOC_FRACTION
-                        if usdt_alloc <= 0:
-                            print("[ENTRY] No USDT available to allocate")
+                    usdt_alloc = acct.usdt * USDT_ALLOC_FRACTION
+                    if usdt_alloc <= 0:
+                        print("[ENTRY] No USDT available to allocate")
+                    else:
+                        base_cost = spot_fill * (1 + SPOT_TAKER_FEE_PCT / 100)
+                        perp_cost = perp_fill * (PERP_TAKER_FEE_PCT / 100 + 1 / PERP_LEVERAGE)
+                        cost_per_unit = base_cost + perp_cost
+                        max_affordable_qty = acct.usdt / cost_per_unit if cost_per_unit > 0 else 0
+                        target_qty = min(usdt_alloc / spot_fill, max_affordable_qty)
+
+                        if target_qty <= 0:
+                            print("[ENTRY] Insufficient USDT for trade after sizing")
                         else:
-                            # Determine the maximum affordable size given cash, fees, and 1x margin.
-                            cost_per_unit = (
-                                spot_fill * (1 + SPOT_TAKER_FEE_PCT / 100)
-                                + perp_fill * (PERP_TAKER_FEE_PCT / 100 + 1 / PERP_LEVERAGE)
-                            )
-                            max_affordable_qty = acct.usdt / cost_per_unit if cost_per_unit > 0 else 0
-                            target_qty = min(usdt_alloc / spot_fill, max_affordable_qty)
-
-                            if target_qty <= 0:
-                                print("[ENTRY] Insufficient USDT for trade after sizing")
-                            else:
-                                base_qty = target_qty
+                            base_qty = target_qty
+                            if trade_dir == "SHORT_PERP_LONG_SPOT":
                                 spot_cost = base_qty * spot_fill
                                 spot_fee = fee(spot_cost, SPOT_TAKER_FEE_PCT)
 
@@ -335,19 +604,83 @@ async def main():
                                     acct.perp.qty = -base_qty
                                     acct.perp.entry = perp_fill
                                     acct.perp.margin = perp_margin
+                                    acct.spot_margin = 0.0
 
                                     acct.fees += spot_fee + perp_fee
                                     acct.trades += 1
                                     acct.last_action = "ENTER"
                                     open_basis = basis
+                                    entry_time = now_ts
 
                                     print(
                                         f"[ENTRY] spot_buy={spot_fill:.6f} perp_short={perp_fill:.6f} "
                                         f"qty={base_qty:.6f} fees={spot_fee+perp_fee:.6f}"
                                     )
-                else:
-                    print("[ENTRY CHECK] Not armed — no trade")
 
+                                    log_trade(
+                                        "ENTER",
+                                        basis_pct=basis,
+                                        spot_price=spot_fill,
+                                        perp_price=perp_fill,
+                                        qty=base_qty,
+                                        fees=spot_fee + perp_fee,
+                                        realized_pnl=0.0,
+                                        usdt_balance=acct.usdt,
+                                        base_balance=acct.base,
+                                        perp_qty=acct.perp.qty,
+                                        perp_entry=acct.perp.entry,
+                                        perp_margin=acct.perp.margin,
+                                        note=f"trade_dir={trade_dir}",
+                                    )
+                            else:
+                                spot_margin_required = base_qty * spot_fill
+                                spot_fee = fee(spot_margin_required, SPOT_TAKER_FEE_PCT)
+
+                                perp_notional = base_qty * perp_fill
+                                perp_fee = fee(perp_notional, PERP_TAKER_FEE_PCT)
+                                perp_margin = perp_notional / PERP_LEVERAGE
+
+                                total_cash_needed = spot_margin_required + spot_fee + perp_fee + perp_margin
+                                if total_cash_needed > acct.usdt:
+                                    print(
+                                        f"[ENTRY] Insufficient USDT for trade "
+                                        f"(needed {total_cash_needed:.4f}, have {acct.usdt:.4f})"
+                                    )
+                                else:
+                                    acct.usdt -= total_cash_needed
+                                    acct.base -= base_qty
+
+                                    acct.perp.qty = base_qty
+                                    acct.perp.entry = perp_fill
+                                    acct.perp.margin = perp_margin
+                                    acct.spot_margin = spot_margin_required
+
+                                    acct.fees += spot_fee + perp_fee
+                                    acct.trades += 1
+                                    acct.last_action = "ENTER"
+                                    open_basis = basis
+                                    entry_time = now_ts
+
+                                    print(
+                                        f"[ENTRY] spot_short_px={spot_fill:.6f} perp_long={perp_fill:.6f} "
+                                        f"qty={base_qty:.6f} fees={spot_fee+perp_fee:.6f}"
+                                    )
+
+                                    log_trade(
+                                        "ENTER",
+                                        basis_pct=basis,
+                                        spot_price=spot_fill,
+                                        perp_price=perp_fill,
+                                        qty=base_qty,
+                                        fees=spot_fee + perp_fee,
+                                        realized_pnl=0.0,
+                                        usdt_balance=acct.usdt,
+                                        base_balance=acct.base,
+                                        perp_qty=acct.perp.qty,
+                                        perp_entry=acct.perp.entry,
+                                        perp_margin=acct.perp.margin,
+                                        note=f"trade_dir={trade_dir}",
+                                    )
         if time.time() - last_ui > UI_REFRESH_SEC:
             last_ui = time.time()
             clear()
@@ -356,7 +689,11 @@ async def main():
             print(f"PERP bid/ask: {fmt(perp.bid)} / {fmt(perp.ask)}")
             print(f"MAX POS BASIS: {max_pos_basis:+.4f}%")
             print(f"DYNAMIC ENTRY: {fmt(dyn_entry,4)} {'ARMED' if armed else 'DISARMED'}")
-            print(f"ACCOUNT USDT={acct.usdt:.2f} BASE={acct.base:.6f}")
+            print(f"ACCOUNT USDT={acct.usdt:.2f} {BASE_ASSET}={acct.base:.6f} spot_margin={acct.spot_margin:.4f}")
+            basis_std_display = basis_std
+            pred_text = "-" if predicted_pnl is None else f"{predicted_pnl:+.4f} USDT ({predicted_reason})"
+            print(f"EMA_SLOPE={vwap_slope:+.6f} BASIS_STD={basis_std_display:.4f} TRADING={'ON' if trading_enabled else 'OFF'}")
+            print(f"PREDICTED_PNL_IF_ENTER: {pred_text}")
             print("=" * 80)
 
         await asyncio.sleep(0.05)

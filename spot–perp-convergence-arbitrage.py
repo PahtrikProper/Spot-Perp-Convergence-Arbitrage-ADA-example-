@@ -324,6 +324,7 @@ async def main():
     ema_price = None
     last_ema_ts = None
     vwap_slope = 0.0
+    basis_std = 0.0
     basis_history: deque = deque()
     rolling_pnl: deque = deque()
 

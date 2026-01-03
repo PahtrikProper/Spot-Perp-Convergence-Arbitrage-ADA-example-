@@ -16,7 +16,7 @@ import websockets
 # =========================
 # CONFIG
 # =========================
-SYMBOL = "SOLUSDT"
+SYMBOL = "ADAUSDT"
 START_USDT = 100.0
 
 UI_REFRESH_SEC = 0.25
@@ -25,6 +25,7 @@ USDT_ALLOC_FRACTION = 0.95
 ENTRY_FRACTION = 0.70
 SAFETY_BUFFER_PCT = 0.05
 EXIT_BASIS_PCT = 0.10
+EXIT_COMPRESSION_FRACTION = 0.30
 
 SPOT_TAKER_FEE_PCT = 0.10
 PERP_TAKER_FEE_PCT = 0.055
@@ -108,6 +109,7 @@ class Account:
             + self.base * spot
             + self.perp.realized
             + self.perp.u_pnl(perp)
+            + self.perp.margin
         )
 
 
@@ -213,42 +215,122 @@ async def main():
 
             print(f"[TICK] spot={s:.6f} perp={p:.6f} basis={basis:+.4f}%")
 
-            if basis > 0:
-                if basis > max_pos_basis:
-                    print(f"[BASIS] New MAX POSITIVE BASIS: {basis:+.4f}% (prev {max_pos_basis:+.4f}%)")
-                    max_pos_basis = basis
-
-            min_ok, fee_part, slip_part = min_viable_basis()
-
-            print(
-                f"[CHECK] min_viable={min_ok:.4f}% "
-                f"(fees={fee_part:.4f}% slip={slip_part:.4f}% buffer={SAFETY_BUFFER_PCT:.4f}%)"
-            )
-
-            if max_pos_basis >= min_ok:
-                armed = True
-                dyn_entry = max_pos_basis * ENTRY_FRACTION
-                print(f"[ARM] Strategy ARMED | dynamic_entry={dyn_entry:.4f}%")
-            else:
-                armed = False
-                dyn_entry = None
-                print("[ARM] Strategy DISARMED (insufficient edge)")
-
             if acct.perp.open():
                 liq = liq_price_short(acct.perp.entry)
                 print(f"[RISK] Perp open | liq≈{liq:.6f}")
 
-                if p >= liq:
-                    print("[STOP] LIQ GUARD HIT — EXITING")
-                    # exit logic would go here
+                eq = acct.equity(s, p)
+                pnl = eq - start_eq
+                exit_basis = max(EXIT_BASIS_PCT, (open_basis or 0.0) * EXIT_COMPRESSION_FRACTION)
+                tp_hit = pnl >= TAKE_PROFIT_USDT
+                sl_hit = pnl <= -STOP_LOSS_USDT
+                basis_hit = basis <= exit_basis
+                liq_hit = p >= liq
+
+                print(
+                    f"[POSITION] basis={basis:+.4f}% open_basis={fmt(open_basis,4)} "
+                    f"exit_thresh={exit_basis:.4f}% pnl={pnl:+.4f}USDT"
+                )
+                print(
+                    f"[EXIT CHECK] tp={tp_hit} sl={sl_hit} basis_hit={basis_hit} liq_hit={liq_hit}"
+                )
+
+                if tp_hit or sl_hit or basis_hit or liq_hit:
+                    spot_exit = slip(s, SPOT_SLIPPAGE_BPS, "sell")
+                    perp_exit = slip(p, PERP_SLIPPAGE_BPS, "buy")
+
+                    spot_proceeds = acct.base * spot_exit
+                    spot_fee = fee(spot_proceeds, SPOT_TAKER_FEE_PCT)
+
+                    perp_notional = abs(acct.perp.qty) * perp_exit
+                    perp_fee = fee(perp_notional, PERP_TAKER_FEE_PCT)
+                    perp_realized = acct.perp.qty * (perp_exit - acct.perp.entry)
+
+                    acct.fees += spot_fee + perp_fee
+                    acct.perp.realized += perp_realized
+                    acct.usdt += spot_proceeds - spot_fee + perp_realized + acct.perp.margin - perp_fee
+
+                    print(
+                        f"[EXIT] spot_sell={spot_exit:.6f} perp_cover={perp_exit:.6f} "
+                        f"realized={perp_realized:+.6f} fees={spot_fee+perp_fee:.6f}"
+                    )
+
+                    acct.base = 0.0
+                    acct.perp = PerpPos()
+                    acct.trades += 1
+                    acct.last_action = "EXIT"
+                    open_basis = None
+                    max_pos_basis = 0.0
+                    dyn_entry = None
+                    armed = False
+                else:
+                    print("[HOLD] Staying in position")
             else:
+                if basis > 0:
+                    if basis > max_pos_basis:
+                        print(f"[BASIS] New MAX POSITIVE BASIS: {basis:+.4f}% (prev {max_pos_basis:+.4f}%)")
+                        max_pos_basis = basis
+
+                min_ok, fee_part, slip_part = min_viable_basis()
+
+                print(
+                    f"[CHECK] min_viable={min_ok:.4f}% "
+                    f"(fees={fee_part:.4f}% slip={slip_part:.4f}% buffer={SAFETY_BUFFER_PCT:.4f}%)"
+                )
+
+                if max_pos_basis >= min_ok:
+                    armed = True
+                    dyn_entry = max_pos_basis * ENTRY_FRACTION
+                    print(f"[ARM] Strategy ARMED | dynamic_entry={dyn_entry:.4f}%")
+                else:
+                    armed = False
+                    dyn_entry = None
+                    print("[ARM] Strategy DISARMED (insufficient edge)")
+
                 if armed:
                     print(
                         f"[ENTRY CHECK] basis={basis:.4f}% "
                         f"required={dyn_entry:.4f}%"
                     )
                     if dyn_entry and basis >= dyn_entry:
-                        print("[ENTRY] >>> WOULD ENTER TRADE HERE <<<")
+                        spot_fill = slip(s, SPOT_SLIPPAGE_BPS, "buy")
+                        perp_fill = slip(p, PERP_SLIPPAGE_BPS, "sell")
+
+                        usdt_alloc = acct.usdt * USDT_ALLOC_FRACTION
+                        if usdt_alloc <= 0:
+                            print("[ENTRY] No USDT available to allocate")
+                        else:
+                            base_qty = usdt_alloc / spot_fill
+                            spot_cost = base_qty * spot_fill
+                            spot_fee = fee(spot_cost, SPOT_TAKER_FEE_PCT)
+
+                            perp_notional = base_qty * perp_fill
+                            perp_fee = fee(perp_notional, PERP_TAKER_FEE_PCT)
+                            perp_margin = perp_notional / PERP_LEVERAGE
+
+                            total_cash_needed = spot_cost + spot_fee + perp_fee + perp_margin
+                            if total_cash_needed > acct.usdt:
+                                print(
+                                    f"[ENTRY] Insufficient USDT for trade "
+                                    f"(needed {total_cash_needed:.4f}, have {acct.usdt:.4f})"
+                                )
+                            else:
+                                acct.usdt -= total_cash_needed
+                                acct.base += base_qty
+
+                                acct.perp.qty = -base_qty
+                                acct.perp.entry = perp_fill
+                                acct.perp.margin = perp_margin
+
+                                acct.fees += spot_fee + perp_fee
+                                acct.trades += 1
+                                acct.last_action = "ENTER"
+                                open_basis = basis
+
+                                print(
+                                    f"[ENTRY] spot_buy={spot_fill:.6f} perp_short={perp_fill:.6f} "
+                                    f"qty={base_qty:.6f} fees={spot_fee+perp_fee:.6f}"
+                                )
                 else:
                     print("[ENTRY CHECK] Not armed — no trade")
 

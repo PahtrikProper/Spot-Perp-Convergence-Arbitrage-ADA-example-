@@ -615,7 +615,8 @@ async def main():
             print(f"MAX POS BASIS: {max_pos_basis:+.4f}%")
             print(f"DYNAMIC ENTRY: {fmt(dyn_entry,4)} {'ARMED' if armed else 'DISARMED'}")
             print(f"ACCOUNT USDT={acct.usdt:.2f} {BASE_ASSET}={acct.base:.6f} spot_margin={acct.spot_margin:.4f}")
-            print(f"EMA_SLOPE={vwap_slope:+.6f} BASIS_STD={basis_std:.4f} TRADING={'ON' if trading_enabled else 'OFF'}")
+            basis_std_display = basis_std
+            print(f"EMA_SLOPE={vwap_slope:+.6f} BASIS_STD={basis_std_display:.4f} TRADING={'ON' if trading_enabled else 'OFF'}")
             print("=" * 80)
 
         await asyncio.sleep(0.05)

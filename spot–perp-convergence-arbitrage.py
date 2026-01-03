@@ -442,6 +442,7 @@ async def main():
                 predicted_reason = f"DIR={candidate_dir}"
                 if predicted_pnl is None:
                     predicted_reason += " NO_SIZE"
+                    predicted_pnl = 0.0
 
             if acct.perp.open():
                 liq = liq_price_short(acct.perp.entry)
@@ -562,6 +563,7 @@ async def main():
                 )
 
                 if not trading_enabled:
+                    predicted_reason = "KILL_SWITCH"
                     print("[ENTRY CHECK] Trading disabled by kill switch")
                 elif not can_enter:
                     print(f"[ENTRY CHECK] Blocked: {trade_dir}")

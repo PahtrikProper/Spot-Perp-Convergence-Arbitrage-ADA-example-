@@ -380,8 +380,8 @@ async def main():
     basis_std = 0.0
     basis_history: deque = deque()
     rolling_pnl: deque = deque()
-    predicted_pnl = None
-    predicted_reason = "-"
+    predicted_pnl = 0.0
+    predicted_reason = "INIT"
 
     asyncio.create_task(ws_stream(WS_SPOT, SYMBOL, spot, "SPOT"))
     asyncio.create_task(ws_stream(WS_LINEAR, SYMBOL, perp, "PERP"))
@@ -396,8 +396,8 @@ async def main():
                 start_eq = acct.equity(s, p)
 
             basis = (p - s) / s * 100
-            predicted_pnl = None
-            predicted_reason = "-"
+            predicted_pnl = 0.0
+            predicted_reason = "INIT"
 
             now_ts = time.time()
 
@@ -424,9 +424,12 @@ async def main():
 
             # Predict PnL for current conditions using funding direction if available
             funding_pct = perp.funding_rate * 100 if perp.funding_rate is not None else None
-            if funding_pct is None or abs(funding_pct) < MIN_FUNDING_ABS:
+            if funding_pct is None:
+                predicted_reason = "NO_FUNDING"
+                predicted_pnl = 0.0
+            elif abs(funding_pct) < MIN_FUNDING_ABS:
                 predicted_reason = "FUNDING_TOO_SMALL"
-                predicted_pnl = None
+                predicted_pnl = 0.0
             else:
                 candidate_dir = "SHORT_PERP_LONG_SPOT" if funding_pct > 0 else "LONG_PERP_SHORT_SPOT"
                 predicted_pnl = predict_pnl_if_enter(
@@ -691,7 +694,7 @@ async def main():
             print(f"DYNAMIC ENTRY: {fmt(dyn_entry,4)} {'ARMED' if armed else 'DISARMED'}")
             print(f"ACCOUNT USDT={acct.usdt:.2f} {BASE_ASSET}={acct.base:.6f} spot_margin={acct.spot_margin:.4f}")
             basis_std_display = basis_std
-            pred_text = "-" if predicted_pnl is None else f"{predicted_pnl:+.4f} USDT ({predicted_reason})"
+            pred_text = f"{predicted_pnl:+.4f} USDT ({predicted_reason})"
             print(f"EMA_SLOPE={vwap_slope:+.6f} BASIS_STD={basis_std_display:.4f} TRADING={'ON' if trading_enabled else 'OFF'}")
             print(f"PREDICTED_PNL_IF_ENTER: {pred_text}")
             print("=" * 80)

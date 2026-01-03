@@ -418,6 +418,27 @@ async def main():
 
             fee_pct = 2 * (SPOT_TAKER_FEE_PCT + PERP_TAKER_FEE_PCT)
 
+            now_ts = time.time()
+
+            if ema_price is None:
+                ema_price = (s + p) / 2
+                last_ema_ts = now_ts
+            else:
+                dt = max(now_ts - last_ema_ts, 1e-6)
+                alpha = 1 - pow(2.718281828, -dt / EMA_PERIOD_SEC)
+                prev_ema = ema_price
+                ema_price = prev_ema + alpha * (((s + p) / 2) - prev_ema)
+                vwap_slope = (ema_price - prev_ema) / dt
+                last_ema_ts = now_ts
+
+            basis_history.append((now_ts, basis))
+            while basis_history and now_ts - basis_history[0][0] > BASIS_STD_WINDOW_SEC:
+                basis_history.popleft()
+            basis_values = [b for _, b in basis_history]
+            basis_std = statistics.pstdev(basis_values) if len(basis_values) > 1 else 0.0
+
+            fee_pct = 2 * (SPOT_TAKER_FEE_PCT + PERP_TAKER_FEE_PCT)
+
             print(f"[TICK] spot={s:.6f} perp={p:.6f} basis={basis:+.4f}%")
 
             if acct.perp.open():

@@ -32,7 +32,7 @@ PERP_TAKER_FEE_PCT = 0.055
 SPOT_SLIPPAGE_BPS = 2.0
 PERP_SLIPPAGE_BPS = 2.0
 
-PERP_LEVERAGE = 3.0
+PERP_LEVERAGE = 1.0
 MMR_EST_PCT = 0.50
 
 TAKE_PROFIT_USDT = 1.00
@@ -303,37 +303,48 @@ async def main():
                         if usdt_alloc <= 0:
                             print("[ENTRY] No USDT available to allocate")
                         else:
-                            base_qty = usdt_alloc / spot_fill
-                            spot_cost = base_qty * spot_fill
-                            spot_fee = fee(spot_cost, SPOT_TAKER_FEE_PCT)
+                            # Determine the maximum affordable size given cash, fees, and 1x margin.
+                            cost_per_unit = (
+                                spot_fill * (1 + SPOT_TAKER_FEE_PCT / 100)
+                                + perp_fill * (PERP_TAKER_FEE_PCT / 100 + 1 / PERP_LEVERAGE)
+                            )
+                            max_affordable_qty = acct.usdt / cost_per_unit if cost_per_unit > 0 else 0
+                            target_qty = min(usdt_alloc / spot_fill, max_affordable_qty)
 
-                            perp_notional = base_qty * perp_fill
-                            perp_fee = fee(perp_notional, PERP_TAKER_FEE_PCT)
-                            perp_margin = perp_notional / PERP_LEVERAGE
-
-                            total_cash_needed = spot_cost + spot_fee + perp_fee + perp_margin
-                            if total_cash_needed > acct.usdt:
-                                print(
-                                    f"[ENTRY] Insufficient USDT for trade "
-                                    f"(needed {total_cash_needed:.4f}, have {acct.usdt:.4f})"
-                                )
+                            if target_qty <= 0:
+                                print("[ENTRY] Insufficient USDT for trade after sizing")
                             else:
-                                acct.usdt -= total_cash_needed
-                                acct.base += base_qty
+                                base_qty = target_qty
+                                spot_cost = base_qty * spot_fill
+                                spot_fee = fee(spot_cost, SPOT_TAKER_FEE_PCT)
 
-                                acct.perp.qty = -base_qty
-                                acct.perp.entry = perp_fill
-                                acct.perp.margin = perp_margin
+                                perp_notional = base_qty * perp_fill
+                                perp_fee = fee(perp_notional, PERP_TAKER_FEE_PCT)
+                                perp_margin = perp_notional / PERP_LEVERAGE
 
-                                acct.fees += spot_fee + perp_fee
-                                acct.trades += 1
-                                acct.last_action = "ENTER"
-                                open_basis = basis
+                                total_cash_needed = spot_cost + spot_fee + perp_fee + perp_margin
+                                if total_cash_needed > acct.usdt:
+                                    print(
+                                        f"[ENTRY] Insufficient USDT for trade "
+                                        f"(needed {total_cash_needed:.4f}, have {acct.usdt:.4f})"
+                                    )
+                                else:
+                                    acct.usdt -= total_cash_needed
+                                    acct.base += base_qty
 
-                                print(
-                                    f"[ENTRY] spot_buy={spot_fill:.6f} perp_short={perp_fill:.6f} "
-                                    f"qty={base_qty:.6f} fees={spot_fee+perp_fee:.6f}"
-                                )
+                                    acct.perp.qty = -base_qty
+                                    acct.perp.entry = perp_fill
+                                    acct.perp.margin = perp_margin
+
+                                    acct.fees += spot_fee + perp_fee
+                                    acct.trades += 1
+                                    acct.last_action = "ENTER"
+                                    open_basis = basis
+
+                                    print(
+                                        f"[ENTRY] spot_buy={spot_fill:.6f} perp_short={perp_fill:.6f} "
+                                        f"qty={base_qty:.6f} fees={spot_fee+perp_fee:.6f}"
+                                    )
                 else:
                     print("[ENTRY CHECK] Not armed — no trade")
 

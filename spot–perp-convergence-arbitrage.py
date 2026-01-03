@@ -381,6 +381,7 @@ async def main():
     basis_history: deque = deque()
     rolling_pnl: deque = deque()
     predicted_pnl = None
+    predicted_reason = "-"
 
     asyncio.create_task(ws_stream(WS_SPOT, SYMBOL, spot, "SPOT"))
     asyncio.create_task(ws_stream(WS_LINEAR, SYMBOL, perp, "PERP"))
@@ -396,27 +397,7 @@ async def main():
 
             basis = (p - s) / s * 100
             predicted_pnl = None
-
-            now_ts = time.time()
-
-            if ema_price is None:
-                ema_price = (s + p) / 2
-                last_ema_ts = now_ts
-            else:
-                dt = max(now_ts - last_ema_ts, 1e-6)
-                alpha = 1 - pow(2.718281828, -dt / EMA_PERIOD_SEC)
-                prev_ema = ema_price
-                ema_price = prev_ema + alpha * (((s + p) / 2) - prev_ema)
-                vwap_slope = (ema_price - prev_ema) / dt
-                last_ema_ts = now_ts
-
-            basis_history.append((now_ts, basis))
-            while basis_history and now_ts - basis_history[0][0] > BASIS_STD_WINDOW_SEC:
-                basis_history.popleft()
-            basis_values = [b for _, b in basis_history]
-            basis_std = statistics.pstdev(basis_values) if len(basis_values) > 1 else 0.0
-
-            fee_pct = 2 * (SPOT_TAKER_FEE_PCT + PERP_TAKER_FEE_PCT)
+            predicted_reason = "-"
 
             now_ts = time.time()
 
@@ -440,6 +421,24 @@ async def main():
             fee_pct = 2 * (SPOT_TAKER_FEE_PCT + PERP_TAKER_FEE_PCT)
 
             print(f"[TICK] spot={s:.6f} perp={p:.6f} basis={basis:+.4f}%")
+
+            # Predict PnL for current conditions using funding direction if available
+            funding_pct = perp.funding_rate * 100 if perp.funding_rate is not None else None
+            if funding_pct is None or abs(funding_pct) < MIN_FUNDING_ABS:
+                predicted_reason = "FUNDING_TOO_SMALL"
+                predicted_pnl = None
+            else:
+                candidate_dir = "SHORT_PERP_LONG_SPOT" if funding_pct > 0 else "LONG_PERP_SHORT_SPOT"
+                predicted_pnl = predict_pnl_if_enter(
+                    spot_price=s,
+                    perp_price=p,
+                    basis=basis,
+                    trade_dir=candidate_dir,
+                    usdt_balance=acct.usdt,
+                )
+                predicted_reason = f"DIR={candidate_dir}"
+                if predicted_pnl is None:
+                    predicted_reason += " NO_SIZE"
 
             if acct.perp.open():
                 liq = liq_price_short(acct.perp.entry)
@@ -570,14 +569,6 @@ async def main():
                     spot_fill = slip(s, SPOT_SLIPPAGE_BPS, spot_side)
                     perp_fill = slip(p, PERP_SLIPPAGE_BPS, perp_side)
 
-                    predicted_pnl = predict_pnl_if_enter(
-                        spot_price=s,
-                        perp_price=p,
-                        basis=basis,
-                        trade_dir=trade_dir,
-                        usdt_balance=acct.usdt,
-                    )
-
                     usdt_alloc = acct.usdt * USDT_ALLOC_FRACTION
                     if usdt_alloc <= 0:
                         print("[ENTRY] No USDT available to allocate")
@@ -700,7 +691,7 @@ async def main():
             print(f"DYNAMIC ENTRY: {fmt(dyn_entry,4)} {'ARMED' if armed else 'DISARMED'}")
             print(f"ACCOUNT USDT={acct.usdt:.2f} {BASE_ASSET}={acct.base:.6f} spot_margin={acct.spot_margin:.4f}")
             basis_std_display = basis_std
-            pred_text = "-" if predicted_pnl is None else f"{predicted_pnl:+.4f} USDT"
+            pred_text = "-" if predicted_pnl is None else f"{predicted_pnl:+.4f} USDT ({predicted_reason})"
             print(f"EMA_SLOPE={vwap_slope:+.6f} BASIS_STD={basis_std_display:.4f} TRADING={'ON' if trading_enabled else 'OFF'}")
             print(f"PREDICTED_PNL_IF_ENTER: {pred_text}")
             print("=" * 80)

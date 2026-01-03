@@ -8,7 +8,7 @@ NOTHING IS SILENT.
 """
 
 from __future__ import annotations
-import asyncio, json, os, time
+import asyncio, csv, json, os, time
 from dataclasses import dataclass, field
 from typing import Optional
 import websockets
@@ -42,6 +42,25 @@ WS_SPOT   = "wss://stream.bybit.com/v5/public/spot"
 WS_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 PING_EVERY_SEC = 20.0
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRADE_LOG_PATH = os.path.join(SCRIPT_DIR, "trade_log.csv")
+TRADE_LOG_HEADERS = [
+    "timestamp_utc",
+    "action",
+    "basis_pct",
+    "spot_price",
+    "perp_price",
+    "qty",
+    "realized_pnl",
+    "fees",
+    "usdt_balance",
+    "base_balance",
+    "perp_qty",
+    "perp_entry",
+    "perp_margin",
+    "note",
+]
+
 
 # =========================
 # HELPERS
@@ -57,6 +76,47 @@ def fmt(x, n=6):
 
 def bps_to_pct(bps):
     return bps / 100.0
+
+
+def log_trade(
+    action: str,
+    *,
+    basis_pct: float,
+    spot_price: float,
+    perp_price: float,
+    qty: float,
+    fees: float,
+    realized_pnl: float,
+    usdt_balance: float,
+    base_balance: float,
+    perp_qty: float,
+    perp_entry: float,
+    perp_margin: float,
+    note: str = "",
+):
+    row = {
+        "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "action": action,
+        "basis_pct": f"{basis_pct:.6f}",
+        "spot_price": f"{spot_price:.8f}",
+        "perp_price": f"{perp_price:.8f}",
+        "qty": f"{qty:.8f}",
+        "realized_pnl": f"{realized_pnl:.8f}",
+        "fees": f"{fees:.8f}",
+        "usdt_balance": f"{usdt_balance:.8f}",
+        "base_balance": f"{base_balance:.8f}",
+        "perp_qty": f"{perp_qty:.8f}",
+        "perp_entry": f"{perp_entry:.8f}",
+        "perp_margin": f"{perp_margin:.8f}",
+        "note": note,
+    }
+
+    file_exists = os.path.exists(TRADE_LOG_PATH)
+    with open(TRADE_LOG_PATH, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_LOG_HEADERS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 # =========================
@@ -240,6 +300,10 @@ async def main():
                     spot_exit = slip(s, SPOT_SLIPPAGE_BPS, "sell")
                     perp_exit = slip(p, PERP_SLIPPAGE_BPS, "buy")
 
+                    exit_qty = acct.base
+                    exit_perp_entry = acct.perp.entry
+                    exit_perp_margin = acct.perp.margin
+
                     spot_proceeds = acct.base * spot_exit
                     spot_fee = fee(spot_proceeds, SPOT_TAKER_FEE_PCT)
 
@@ -260,6 +324,23 @@ async def main():
                     acct.perp = PerpPos()
                     acct.trades += 1
                     acct.last_action = "EXIT"
+
+                    log_trade(
+                        "EXIT",
+                        basis_pct=basis,
+                        spot_price=spot_exit,
+                        perp_price=perp_exit,
+                        qty=exit_qty,
+                        fees=spot_fee + perp_fee,
+                        realized_pnl=perp_realized,
+                        usdt_balance=acct.usdt,
+                        base_balance=acct.base,
+                        perp_qty=acct.perp.qty,
+                        perp_entry=exit_perp_entry,
+                        perp_margin=exit_perp_margin,
+                        note=f"pnl={pnl:+.4f}USDT",
+                    )
+
                     open_basis = None
                     max_pos_basis = 0.0
                     dyn_entry = None
@@ -344,6 +425,22 @@ async def main():
                                     print(
                                         f"[ENTRY] spot_buy={spot_fill:.6f} perp_short={perp_fill:.6f} "
                                         f"qty={base_qty:.6f} fees={spot_fee+perp_fee:.6f}"
+                                    )
+
+                                    log_trade(
+                                        "ENTER",
+                                        basis_pct=basis,
+                                        spot_price=spot_fill,
+                                        perp_price=perp_fill,
+                                        qty=base_qty,
+                                        fees=spot_fee + perp_fee,
+                                        realized_pnl=0.0,
+                                        usdt_balance=acct.usdt,
+                                        base_balance=acct.base,
+                                        perp_qty=acct.perp.qty,
+                                        perp_entry=acct.perp.entry,
+                                        perp_margin=acct.perp.margin,
+                                        note=f"dyn_entry={dyn_entry:+.4f}%",
                                     )
                 else:
                     print("[ENTRY CHECK] Not armed — no trade")

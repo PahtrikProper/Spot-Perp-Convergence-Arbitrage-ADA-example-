@@ -211,6 +211,59 @@ def slip(price, bps, side):
     return price * (1 + pct if side == "buy" else 1 - pct)
 
 
+def predict_pnl_if_enter(
+    *,
+    spot_price,
+    perp_price,
+    basis,
+    trade_dir,
+    usdt_balance,
+):
+    spot_side = "buy" if trade_dir == "SHORT_PERP_LONG_SPOT" else "sell"
+    perp_side = "sell" if trade_dir == "SHORT_PERP_LONG_SPOT" else "buy"
+
+    spot_fill = slip(spot_price, SPOT_SLIPPAGE_BPS, spot_side)
+    perp_fill = slip(perp_price, PERP_SLIPPAGE_BPS, perp_side)
+
+    usdt_alloc = usdt_balance * USDT_ALLOC_FRACTION
+    if usdt_alloc <= 0:
+        return None
+
+    base_cost = spot_fill * (1 + SPOT_TAKER_FEE_PCT / 100)
+    perp_cost = perp_fill * (PERP_TAKER_FEE_PCT / 100 + 1 / PERP_LEVERAGE)
+    cost_per_unit = base_cost + perp_cost
+    max_affordable_qty = usdt_balance / cost_per_unit if cost_per_unit > 0 else 0
+    qty = min(usdt_alloc / spot_fill, max_affordable_qty)
+    if qty <= 0:
+        return None
+
+    target_basis = basis * 0.25
+    if trade_dir == "SHORT_PERP_LONG_SPOT":
+        spot_entry = spot_fill
+        spot_exit = spot_entry
+        perp_entry = perp_fill
+        perp_exit = spot_exit * (1 + target_basis / 100)
+
+        spot_pnl = (spot_exit - spot_entry) * qty
+        perp_pnl = -qty * (perp_exit - perp_entry)
+    else:
+        spot_entry = spot_fill
+        spot_exit = spot_entry
+        perp_entry = perp_fill
+        perp_exit = spot_exit * (1 + target_basis / 100)
+
+        spot_pnl = (spot_entry - spot_exit) * qty
+        perp_pnl = qty * (perp_exit - perp_entry)
+
+    spot_fee_entry = fee(abs(spot_entry * qty), SPOT_TAKER_FEE_PCT)
+    spot_fee_exit = fee(abs(spot_exit * qty), SPOT_TAKER_FEE_PCT)
+    perp_fee_entry = fee(abs(perp_entry * qty), PERP_TAKER_FEE_PCT)
+    perp_fee_exit = fee(abs(perp_exit * qty), PERP_TAKER_FEE_PCT)
+
+    total_fees = spot_fee_entry + spot_fee_exit + perp_fee_entry + perp_fee_exit
+    return spot_pnl + perp_pnl - total_fees
+
+
 def should_enter_trade(
     basis_pct,
     funding_rate,
@@ -327,6 +380,7 @@ async def main():
     basis_std = 0.0
     basis_history: deque = deque()
     rolling_pnl: deque = deque()
+    predicted_pnl = None
 
     asyncio.create_task(ws_stream(WS_SPOT, SYMBOL, spot, "SPOT"))
     asyncio.create_task(ws_stream(WS_LINEAR, SYMBOL, perp, "PERP"))
@@ -341,6 +395,28 @@ async def main():
                 start_eq = acct.equity(s, p)
 
             basis = (p - s) / s * 100
+            predicted_pnl = None
+
+            now_ts = time.time()
+
+            if ema_price is None:
+                ema_price = (s + p) / 2
+                last_ema_ts = now_ts
+            else:
+                dt = max(now_ts - last_ema_ts, 1e-6)
+                alpha = 1 - pow(2.718281828, -dt / EMA_PERIOD_SEC)
+                prev_ema = ema_price
+                ema_price = prev_ema + alpha * (((s + p) / 2) - prev_ema)
+                vwap_slope = (ema_price - prev_ema) / dt
+                last_ema_ts = now_ts
+
+            basis_history.append((now_ts, basis))
+            while basis_history and now_ts - basis_history[0][0] > BASIS_STD_WINDOW_SEC:
+                basis_history.popleft()
+            basis_values = [b for _, b in basis_history]
+            basis_std = statistics.pstdev(basis_values) if len(basis_values) > 1 else 0.0
+
+            fee_pct = 2 * (SPOT_TAKER_FEE_PCT + PERP_TAKER_FEE_PCT)
 
             now_ts = time.time()
 
@@ -494,6 +570,14 @@ async def main():
                     spot_fill = slip(s, SPOT_SLIPPAGE_BPS, spot_side)
                     perp_fill = slip(p, PERP_SLIPPAGE_BPS, perp_side)
 
+                    predicted_pnl = predict_pnl_if_enter(
+                        spot_price=s,
+                        perp_price=p,
+                        basis=basis,
+                        trade_dir=trade_dir,
+                        usdt_balance=acct.usdt,
+                    )
+
                     usdt_alloc = acct.usdt * USDT_ALLOC_FRACTION
                     if usdt_alloc <= 0:
                         print("[ENTRY] No USDT available to allocate")
@@ -616,7 +700,9 @@ async def main():
             print(f"DYNAMIC ENTRY: {fmt(dyn_entry,4)} {'ARMED' if armed else 'DISARMED'}")
             print(f"ACCOUNT USDT={acct.usdt:.2f} {BASE_ASSET}={acct.base:.6f} spot_margin={acct.spot_margin:.4f}")
             basis_std_display = basis_std
+            pred_text = "-" if predicted_pnl is None else f"{predicted_pnl:+.4f} USDT"
             print(f"EMA_SLOPE={vwap_slope:+.6f} BASIS_STD={basis_std_display:.4f} TRADING={'ON' if trading_enabled else 'OFF'}")
+            print(f"PREDICTED_PNL_IF_ENTER: {pred_text}")
             print("=" * 80)
 
         await asyncio.sleep(0.05)

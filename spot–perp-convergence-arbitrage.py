@@ -197,6 +197,7 @@ async def main():
     max_pos_basis = 0.0
     dyn_entry = None
     armed = False
+    open_basis = None
     start_eq = None
 
     asyncio.create_task(ws_stream(WS_SPOT, SYMBOL, spot, "SPOT"))
@@ -263,9 +264,11 @@ async def main():
                     max_pos_basis = 0.0
                     dyn_entry = None
                     armed = False
+                    start_eq = acct.equity(s, p)
                 else:
                     print("[HOLD] Staying in position")
             else:
+                start_eq = acct.equity(s, p)
                 if basis > 0:
                     if basis > max_pos_basis:
                         print(f"[BASIS] New MAX POSITIVE BASIS: {basis:+.4f}% (prev {max_pos_basis:+.4f}%)")

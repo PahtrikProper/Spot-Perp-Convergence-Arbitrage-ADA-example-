@@ -16,7 +16,8 @@ import websockets
 # =========================
 # CONFIG
 # =========================
-SYMBOL = "ADAUSDT"
+SYMBOL = "SOLUSDT"
+BASE_ASSET = SYMBOL.replace("USDT", "").replace("USD", "")
 START_USDT = 100.0
 
 UI_REFRESH_SEC = 0.25
@@ -453,7 +454,7 @@ async def main():
             print(f"PERP bid/ask: {fmt(perp.bid)} / {fmt(perp.ask)}")
             print(f"MAX POS BASIS: {max_pos_basis:+.4f}%")
             print(f"DYNAMIC ENTRY: {fmt(dyn_entry,4)} {'ARMED' if armed else 'DISARMED'}")
-            print(f"ACCOUNT USDT={acct.usdt:.2f} BASE={acct.base:.6f}")
+            print(f"ACCOUNT USDT={acct.usdt:.2f} {BASE_ASSET}={acct.base:.6f}")
             print("=" * 80)
 
         await asyncio.sleep(0.05)
